@@ -1,0 +1,148 @@
+package com.mockgps.app
+
+import android.app.Activity
+import android.content.Context
+import android.location.Location
+import android.location.LocationManager
+import android.os.Bundle
+import android.os.SystemClock
+import android.util.Log
+import android.widget.TextView
+import android.widget.Toast
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.concurrent.thread
+import kotlin.math.*
+import kotlin.random.Random
+
+class MainActivity : Activity() {
+
+    private lateinit var locationManager: LocationManager
+    private val providerName = LocationManager.GPS_PROVIDER
+    private var isRunning = false
+
+    // LINK ĐÃ ĐƯỢC THAY BẰNG KHO PUBLIC CỦA BẠN (KHÔNG BỊ HẾT HẠN)
+    private val githubRawUrl = "https://raw.githubusercontent.com/nhatnam6a1tdn-afk/Fake-gps/main/route.json"
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val textView = TextView(this)
+        textView.text = "Đang kết nối GitHub và khởi tạo Mock GPS..."
+        textView.textSize = 18f
+        textView.setPadding(32, 32, 32, 32)
+        setContentView(textView)
+
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+        try {
+            locationManager.addTestProvider(providerName, false, false, false, false, true, true, true, 0, 5)
+            locationManager.setTestProviderEnabled(providerName, true)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Vui lòng chọn app này trong Tùy chọn nhà phát triển -> Ứng dụng vị trí giả", Toast.LENGTH_LONG).show()
+            textView.text = "LỖI: Chưa cấp quyền Ứng dụng vị trí giả trong Cài đặt hệ thống!"
+            return
+        }
+
+        isRunning = true
+        thread {
+            try {
+                val json = fetchRouteFromGithub()
+                val speedKmh = json.getDouble("speed_kmh")
+                val waypoints = json.getJSONArray("waypoints")
+                
+                runOnUiThread { textView.text = "Đã tải xong lộ trình! Bắt đầu chạy ở tốc độ $speedKmh km/h..." }
+                startSimulation(waypoints, speedKmh)
+            } catch (e: Exception) {
+                runOnUiThread { textView.text = "Lỗi tải cấu hình: ${e.message}" }
+            }
+        }
+    }
+
+    private fun fetchRouteFromGithub(): JSONObject {
+        val connection = URL(githubRawUrl).openConnection() as HttpURLConnection
+        val reader = BufferedReader(InputStreamReader(connection.inputStream))
+        val response = StringBuilder()
+        var line: String?
+        while (reader.readLine().also { line = it } != null) response.append(line)
+        reader.close()
+        return JSONObject(response.toString())
+    }
+
+    private fun startSimulation(waypoints: org.json.JSONArray, speedKmh: Double) {
+        var currentIndex = 0
+        val updateIntervalMs = 1000L
+        val speedMs = speedKmh / 3.6
+
+        while (isRunning) {
+            if (currentIndex >= waypoints.length() - 1) currentIndex = 0
+
+            val startPoint = waypoints.getJSONObject(currentIndex)
+            val endPoint = waypoints.getJSONObject(currentIndex + 1)
+
+            var currentLat = startPoint.getDouble("lat")
+            var currentLng = startPoint.getDouble("lng")
+            val targetLat = endPoint.getDouble("lat")
+            val targetLng = endPoint.getDouble("lng")
+
+            var distanceToTarget = calculateDistance(currentLat, currentLng, targetLat, targetLng)
+
+            while (distanceToTarget > speedMs && isRunning) {
+                val bearing = calculateBearing(currentLat, currentLng, targetLat, targetLng)
+                val nextPos = calculateNextPosition(currentLat, currentLng, bearing, speedMs)
+                
+                // Thuật toán tạo nhiễu để tránh bị app thể thao flag
+                val jitterLat = nextPos.first + (Random.nextDouble(-0.00002, 0.00002))
+                val jitterLng = nextPos.second + (Random.nextDouble(-0.00002, 0.00002))
+                
+                pushMockLocation(jitterLat, jitterLng)
+
+                currentLat = nextPos.first
+                currentLng = nextPos.second
+                distanceToTarget = calculateDistance(currentLat, currentLng, targetLat, targetLng)
+                Thread.sleep(updateIntervalMs)
+            }
+            currentIndex++
+        }
+    }
+
+    private fun pushMockLocation(lat: Double, lng: Double) {
+        val mockLocation = Location(providerName).apply {
+            latitude = lat
+            longitude = lng
+            altitude = 10.0 + Random.nextDouble(-2.0, 2.0)
+            accuracy = 5f + Random.nextFloat() * 5f
+            time = System.currentTimeMillis()
+            elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+        }
+        try { locationManager.setTestProviderLocation(providerName, mockLocation) } catch (e: Exception) {}
+    }
+
+    private fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val dLat = Math.toRadians(lat2 - lat1); val dLon = Math.toRadians(lon2 - lon1)
+        val a = sin(dLat / 2) * sin(dLat / 2) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2) * sin(dLon / 2)
+        return 6371000.0 * (2 * atan2(sqrt(a), sqrt(1 - a)))
+    }
+
+    private fun calculateBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val dLon = Math.toRadians(lon2 - lon1)
+        val y = sin(dLon) * cos(Math.toRadians(lat2))
+        val x = cos(Math.toRadians(lat1)) * sin(Math.toRadians(lat2)) - sin(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * cos(dLon)
+        return Math.toDegrees(atan2(y, x))
+    }
+
+    private fun calculateNextPosition(lat: Double, lng: Double, bearing: Double, distance: Double): Pair<Double, Double> {
+        val r = 6371000.0; val radLat = Math.toRadians(lat); val radLng = Math.toRadians(lng); val radBearing = Math.toRadians(bearing)
+        val nextLat = asin(sin(radLat) * cos(distance / r) + cos(radLat) * sin(distance / r) * cos(radBearing))
+        val nextLng = radLng + atan2(sin(radBearing) * sin(distance / r) * cos(radLat), cos(distance / r) - sin(radLat) * sin(nextLat))
+        return Pair(Math.toDegrees(nextLat), Math.toDegrees(nextLng))
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isRunning = false
+        try { locationManager.removeTestProvider(providerName) } catch (e: Exception) {}
+    }
+}
